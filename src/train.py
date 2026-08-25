@@ -101,10 +101,27 @@ class Seq2SeqTransformer(nn.Module):
 
 # --- TRAINING LOOP ---
 def train_epoch(model, dataloader, optimizer, criterion, device):
-    pass
+    model.train()
+    total_loss = 0
+    for src, tgt in dataloader:
+        src, tgt = src.to(device), tgt.to(device)
+        tgt_input, tgt_expected = tgt[:, :-1], tgt[:, 1:]
+        
+        src_mask, tgt_mask = create_masks(src, tgt_input, PAD_IDX)
+        optimizer.zero_grad()
+        
+        logits = model(src, tgt_input, src_mask, tgt_mask)
+        loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_expected.reshape(-1))
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        
+        total_loss += loss.item()
+    return total_loss / len(dataloader)
 
 def main():
-  pass
+    pass
 
 if __name__ == "__main__":
-  main()
+    main()
