@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 import wandb
 import yaml
 import argparse
+from tokenizers import Tokenizer
 
 from models.attention import MultiHeadAttention, GroupedQueryAttention
 from models.norm import LayerNorm, RMSNorm
@@ -121,7 +122,36 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
     return total_loss / len(dataloader)
 
 def main():
-    pass
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, required=True)
+    args = parser.parse_args()
+    
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
+        
+    wandb.init(project="aNLP-Assignment-1", name=config['run_name'], config=config)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Training on {device}...")
+    
+    # Load the Tokenizer for C1
+    if config['tokenization'] == 'subword':
+        tokenizer = Tokenizer.from_file("tokenizer.json")
+        vocab_size = tokenizer.get_vocab_size()
+    else:
+        tokenizer = None
+        vocab_size = 260 # For BLT
+        
+    dataset = CipherDataset('dataset/brown_cipher.txt', 'dataset/brown_plain.txt', config, tokenizer=tokenizer) 
+    dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn)
+    
+    model = Seq2SeqTransformer(config, vocab_size).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
+    
+    for epoch in range(config['epochs']):
+        loss = train_epoch(model, dataloader, optimizer, criterion, device)
+        print(f"Epoch {epoch+1}/{config['epochs']} | Loss: {loss:.4f}")
+        wandb.log({"epoch": epoch, "train_loss": loss})
 
 if __name__ == "__main__":
     main()
