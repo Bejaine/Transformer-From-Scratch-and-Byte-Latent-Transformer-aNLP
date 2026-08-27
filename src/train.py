@@ -11,8 +11,13 @@ from models.attention import MultiHeadAttention, GroupedQueryAttention
 from models.norm import LayerNorm, RMSNorm
 from models.positional import SinusoidalPositionalEncoding
 from models.blt import LocalByteEncoder, LocalByteDecoder
-from dataset import CipherDataset, collate_fn, PAD_IDX
-from utils import create_masks
+from dataset import CipherDataset, collate_fn, PAD_IDX, SOS_IDX, EOS_IDX
+from utils import create_masks, greedy_decode, calculate_metrics
+
+def get_lr_multiplier(step: int, warmup_steps: int = 4000):
+    """Calculates the learning rate multiplier for Transformer warmup."""
+    step = max(1, step)
+    return min(step ** (-0.5), step * (warmup_steps ** (-1.5)))
 
 # --- MODEL ASSEMBLY ---
 class PositionwiseFeedForward(nn.Module):
@@ -100,7 +105,7 @@ class Seq2SeqTransformer(nn.Module):
         return self.generator(self.decode(tgt, self.encode(src, src_mask), src_mask, tgt_mask))
 
 
-# --- TRAINING LOOP ---
+# --- PIPELINE LOOPS ---
 def train_epoch(model, dataloader, optimizer, criterion, device):
     model.train()
     total_loss = 0
@@ -121,6 +126,43 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
         total_loss += loss.item()
     return total_loss / len(dataloader)
 
+def evaluate_epoch(model, dataloader, tokenizer, device, config, epoch):
+    model.eval()
+    all_preds = []
+    all_targets = []
+    is_tokenized = config['tokenization'] == 'subword'
+    
+    print(f"\n--- Decoded Sequences (Epoch {epoch+1}) ---")
+    
+    with torch.no_grad():
+        for i, (src, tgt) in enumerate(dataloader):
+            if i >= 2:  # Limit evaluation to 2 batches for speed
+                break
+                
+            src, tgt = src.to(device), tgt.to(device)
+            src_mask, _ = create_masks(src, tgt, PAD_IDX)
+            
+            # Assignment requirement: Evaluate using greedy decoding
+            pred_ids = greedy_decode(model, src, src_mask, config['max_seq_len'], SOS_IDX, device)
+            
+            for batch_idx, (p, t) in enumerate(zip(pred_ids.cpu().tolist(), tgt.cpu().tolist())):
+                if is_tokenized:
+                    pred_str = tokenizer.decode(p, skip_special_tokens=True)
+                    tgt_str = tokenizer.decode(t, skip_special_tokens=True)
+                else:
+                    pred_str = "".join([chr(max(0, b - 4)) for b in p if b not in (PAD_IDX, SOS_IDX, EOS_IDX)])
+                    tgt_str = "".join([chr(max(0, b - 4)) for b in t if b not in (PAD_IDX, SOS_IDX, EOS_IDX)])
+                    
+                all_preds.append(pred_str)
+                all_targets.append(tgt_str)
+                
+                # Print output to verify sequence generation quality
+                if i == 0 and batch_idx < 3: 
+                    print(f"[TARGET]: {tgt_str}")
+                    print(f"[PRED]  : {pred_str}\n")
+                    
+    return calculate_metrics(all_preds, all_targets, is_tokenized=is_tokenized)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
@@ -131,15 +173,14 @@ def main():
         
     wandb.init(project="aNLP-Assignment-1", name=config['run_name'], config=config)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Training on {device}...")
+    print(f"Training on {device} with {config['epochs']} epochs...")
     
-    # Load the Tokenizer for C1
     if config['tokenization'] == 'subword':
         tokenizer = Tokenizer.from_file("tokenizer.json")
         vocab_size = tokenizer.get_vocab_size()
     else:
         tokenizer = None
-        vocab_size = 260 # For BLT
+        vocab_size = 260
         
     dataset = CipherDataset('dataset/brown_cipher.txt', 'dataset/brown_plain.txt', config, tokenizer=tokenizer) 
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn)
@@ -148,10 +189,55 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
     
+    # Standard Transformer Scheduler mapping the entire run
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=config['learning_rate'], 
+        steps_per_epoch=len(dataloader), 
+        epochs=config['epochs']
+    )
+    
     for epoch in range(config['epochs']):
-        loss = train_epoch(model, dataloader, optimizer, criterion, device)
-        print(f"Epoch {epoch+1}/{config['epochs']} | Loss: {loss:.4f}")
-        wandb.log({"epoch": epoch, "train_loss": loss})
+        # Train
+        model.train()
+        total_loss = 0
+        for src, tgt in dataloader:
+            src, tgt = src.to(device), tgt.to(device)
+            tgt_input, tgt_expected = tgt[:, :-1], tgt[:, 1:]
+            
+            src_mask, tgt_mask = create_masks(src, tgt_input, PAD_IDX)
+            optimizer.zero_grad()
+            
+            logits = model(src, tgt_input, src_mask, tgt_mask)
+            loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_expected.reshape(-1))
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            scheduler.step()
+            total_loss += loss.item()
+            
+        avg_train_loss = total_loss / len(dataloader)
+        
+        # Evaluate
+        metrics = evaluate_epoch(model, dataloader, tokenizer, device, config, epoch)
+        
+        # Log to CLI
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch+1}/{config['epochs']} | Loss: {avg_train_loss:.4f} | LR: {current_lr:.6f}")
+        print(f"Metrics -> Seq Acc: {metrics['seq_accuracy']:.2f}% | Bit Acc: {metrics['bit_accuracy']:.2f}% | Levenshtein: {metrics['avg_levenshtein']:.2f}")
+        if config['tokenization'] == 'subword':
+            print(f"Scores  -> BLEU: {metrics['bleu']:.4f} | ROUGE-L: {metrics['rougeL']:.4f}")
+        
+        # Log to WandB
+        wandb_log_dict = {
+            "epoch": epoch, 
+            "train_loss": avg_train_loss,
+            "learning_rate": current_lr,
+            **metrics
+        }
+        wandb.log(wandb_log_dict)
 
 if __name__ == "__main__":
     main()
