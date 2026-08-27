@@ -14,6 +14,11 @@ from models.blt import LocalByteEncoder, LocalByteDecoder
 from dataset import CipherDataset, collate_fn, PAD_IDX, SOS_IDX, EOS_IDX
 from utils import create_masks, greedy_decode, calculate_metrics
 
+import os
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
+from tokenizers.pre_tokenizers import Whitespace
+
 def get_lr_multiplier(step: int, warmup_steps: int = 4000):
     """Calculates the learning rate multiplier for Transformer warmup."""
     step = max(1, step)
@@ -163,6 +168,19 @@ def evaluate_epoch(model, dataloader, tokenizer, device, config, epoch):
                     
     return calculate_metrics(all_preds, all_targets, is_tokenized=is_tokenized)
 
+def get_or_build_tokenizer(cipher_path, plain_path, vocab_size=1000, save_path="tokenizer.json"):
+    if os.path.exists(save_path):
+        print(f"Loading existing tokenizer from {save_path}...")
+        return Tokenizer.from_file(save_path)
+        
+    print(f"Training new BPE tokenizer (Vocab Size: {vocab_size})...")
+    tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = Whitespace()
+    trainer = BpeTrainer(special_tokens=["[PAD]", "[SOS]", "[EOS]", "[UNK]"], vocab_size=vocab_size)
+    tokenizer.train([cipher_path, plain_path], trainer)
+    tokenizer.save(save_path)
+    return tokenizer
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
@@ -175,8 +193,19 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Training on {device} with {config['epochs']} epochs...")
     
+    # if config['tokenization'] == 'subword':
+    #     tokenizer = Tokenizer.from_file("tokenizer.json")
+    #     vocab_size = tokenizer.get_vocab_size()
+    # else:
+    #     tokenizer = None
+    #     vocab_size = 260
+
     if config['tokenization'] == 'subword':
-        tokenizer = Tokenizer.from_file("tokenizer.json")
+        tokenizer = get_or_build_tokenizer(
+            'dataset/brown_cipher.txt', 
+            'dataset/brown_plain.txt', 
+            vocab_size=1000
+        )
         vocab_size = tokenizer.get_vocab_size()
     else:
         tokenizer = None
