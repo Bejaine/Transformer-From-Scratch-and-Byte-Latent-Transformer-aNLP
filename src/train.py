@@ -28,7 +28,7 @@ CONFIGS = {
     "C2": {
         "run_name": "C2_RoPE_Model",
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.001, "epochs": 100,
+        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0003, "epochs": 100,
         "tokenization": "subword", "pos_type": "rope", "attn_type": "mha", "norm_type": "layernorm"
     }
 }
@@ -164,6 +164,10 @@ def evaluate_epoch(model, dataloader, tokenizer, device, config, epoch):
             pred_ids = greedy_decode(model, src, src_mask, config['max_seq_len'] + 2, SOS_IDX, device)
 
             for batch_idx, (p, t) in enumerate(zip(pred_ids.cpu().tolist(), tgt.cpu().tolist())):
+                if EOS_IDX in p:
+                    p = p[:p.index(EOS_IDX)]
+                if EOS_IDX in t:
+                    t = t[:t.index(EOS_IDX)]
                     
                 if is_tokenized:
                     pred_str = tokenizer.decode(p, skip_special_tokens=True)
