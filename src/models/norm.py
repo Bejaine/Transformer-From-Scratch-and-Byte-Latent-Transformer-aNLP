@@ -30,6 +30,7 @@ class RMSNorm(nn.Module):
     Shapes:
         x: [batch_size, seq_len, d_model]
     """
+    
     def __init__(self, d_model: int, eps: float = 1e-5):
 
         super().__init__()
