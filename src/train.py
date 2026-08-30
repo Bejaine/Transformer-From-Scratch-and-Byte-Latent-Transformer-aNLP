@@ -5,17 +5,12 @@ from torch.utils.data import DataLoader, random_split
 import wandb
 import argparse
 import os
-from tokenizers import Tokenizer
-from tokenizers.models import BPE
-from tokenizers.trainers import BpeTrainer
-from tokenizers.pre_tokenizers import ByteLevel
-from tokenizers.decoders import ByteLevel as ByteLevelDecoder 
 
 from models.attention import MultiHeadAttention, GroupedQueryAttention
 from models.norm import LayerNorm, RMSNorm
 from models.positional import SinusoidalPositionalEncoding
 from models.blt import LocalByteEncoder, LocalByteDecoder
-from dataset import CipherDataset, collate_fn, PAD_IDX, SOS_IDX, EOS_IDX, bits_to_byte_str
+from dataset import CipherDataset, CustomBPE, collate_fn, PAD_IDX, SOS_IDX, EOS_IDX, bits_to_byte_str
 from utils import create_masks, greedy_decode, calculate_metrics
 
 CONFIGS = {
@@ -160,7 +155,6 @@ def evaluate_epoch(model, dataloader, tokenizer, device, config, epoch):
             src, tgt = src.to(device), tgt.to(device)
             src_mask, _ = create_masks(src, tgt, PAD_IDX)
 
-            # Generate max_seq_len + 2 to account for SOS and EOS tokens
             pred_ids = greedy_decode(model, src, src_mask, config['max_seq_len'] + 2, SOS_IDX, device)
 
             for batch_idx, (p, t) in enumerate(zip(pred_ids.cpu().tolist(), tgt.cpu().tolist())):
@@ -185,7 +179,14 @@ def evaluate_epoch(model, dataloader, tokenizer, device, config, epoch):
 
     return calculate_metrics(all_preds, all_targets, is_tokenized=is_tokenized)
 
-def corpus_iterator(cipher_path, plain_path):
+def get_or_build_tokenizer(cipher_path, plain_path, vocab_size=512, save_path="tokenizer.json"):
+    if os.path.exists(save_path):
+        print(f"Loading existing Custom BPE tokenizer from {save_path}...")
+        return CustomBPE.from_file(save_path)
+
+    print(f"Building Custom BPE tokenizer (Vocab Size: {vocab_size})...")
+    tokenizer = CustomBPE(vocab_size=vocab_size)
+
     with open(cipher_path, 'r', encoding='utf-8') as fc, open(plain_path, 'r', encoding='utf-8') as fp:
         full_cipher_bits = "".join([line.strip() for line in fc.readlines()])
         full_plain = "".join([line.strip() for line in fp.readlines()])
@@ -193,26 +194,16 @@ def corpus_iterator(cipher_path, plain_path):
     full_cipher_bytes = bits_to_byte_str(full_cipher_bits)
     chunk_size = 64
 
+    texts = []
+    is_cipher_flags = []
     for i in range(0, len(full_cipher_bytes), chunk_size):
         c_chunk = full_cipher_bytes[i:i + chunk_size]
         p_chunk = full_plain[i:i + chunk_size]
         if len(c_chunk) == chunk_size:
-            yield c_chunk
-            yield p_chunk
+            texts.extend([c_chunk, p_chunk])
+            is_cipher_flags.extend([True, False])
 
-def get_or_build_tokenizer(cipher_path, plain_path, vocab_size=512, save_path="tokenizer.json"):
-    if os.path.exists(save_path):
-        print(f"Loading existing tokenizer from {save_path}...")
-        return Tokenizer.from_file(save_path)
-
-    print(f"Training new BPE tokenizer (Vocab Size: {vocab_size}) with 64-byte window chunking...")
-    tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
-    tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
-    tokenizer.decoder = ByteLevelDecoder() 
-    
-    trainer = BpeTrainer(special_tokens=["[PAD]", "[SOS]", "[EOS]", "[UNK]"], vocab_size=vocab_size)
-
-    tokenizer.train_from_iterator(corpus_iterator(cipher_path, plain_path), trainer=trainer)
+    tokenizer.train(texts, is_cipher_flags)
     tokenizer.save(save_path)
     return tokenizer
 
@@ -229,7 +220,6 @@ def main():
     print(f"Training Config {args.config} on {device} with {config['epochs']} epochs...")
 
     if config['tokenization'] == 'subword':
-        # Setting vocab size directly to 512
         tokenizer = get_or_build_tokenizer('dataset/brown_cipher.txt', 'dataset/brown_plain.txt', vocab_size=512)
         vocab_size = tokenizer.get_vocab_size()
     else:
