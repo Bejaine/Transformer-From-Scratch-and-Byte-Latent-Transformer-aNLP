@@ -8,26 +8,26 @@ import os
 from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
-from tokenizers.pre_tokenizers import Whitespace
+from tokenizers.pre_tokenizers import ByteLevel
 
 from models.attention import MultiHeadAttention, GroupedQueryAttention
 from models.norm import LayerNorm, RMSNorm
 from models.positional import SinusoidalPositionalEncoding
 from models.blt import LocalByteEncoder, LocalByteDecoder
-from dataset import CipherDataset, collate_fn, PAD_IDX, SOS_IDX, EOS_IDX
+from dataset import CipherDataset, collate_fn, PAD_IDX, SOS_IDX, EOS_IDX, bits_to_byte_str
 from utils import create_masks, greedy_decode, calculate_metrics
 
 CONFIGS = {
     "C1": {
         "run_name": "C1_Base_Model",
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 256, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
+        "max_seq_len": 256, "batch_size": 64, "learning_rate": 0.001, "epochs": 100,
         "tokenization": "subword", "pos_type": "sinusoidal", "attn_type": "mha", "norm_type": "layernorm"
     },
     "C2": {
         "run_name": "C2_RoPE_Model",
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 256, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
+        "max_seq_len": 256, "batch_size": 64, "learning_rate": 0.001, "epochs": 100,
         "tokenization": "subword", "pos_type": "rope", "attn_type": "mha", "norm_type": "layernorm"
     }
 }
@@ -47,10 +47,16 @@ class EncoderLayer(nn.Module):
     def __init__(self, config: dict):
         super().__init__()
         d_model = config['d_model']
+        
+        # Check config to see if RoPE is requested
+        use_rope = config.get('pos_type') == 'rope'
+        
         if config.get('attn_type') == 'gqa':
-            self.self_attn = GroupedQueryAttention(d_model, config['num_q_heads'], config['num_kv_heads'])
+            # Pass use_rope to GQA
+            self.self_attn = GroupedQueryAttention(d_model, config['num_q_heads'], config['num_kv_heads'], use_rope=use_rope)
         else:
-            self.self_attn = MultiHeadAttention(d_model, config['num_heads'])
+            # Pass use_rope to MHA
+            self.self_attn = MultiHeadAttention(d_model, config['num_heads'], use_rope=use_rope)
             
         NormClass = RMSNorm if config.get('norm_type') == 'rmsnorm' else LayerNorm
         self.norm1, self.norm2 = NormClass(d_model), NormClass(d_model)
@@ -66,12 +72,17 @@ class DecoderLayer(nn.Module):
     def __init__(self, config: dict):
         super().__init__()
         d_model = config['d_model']
+        
+        use_rope = config.get('pos_type') == 'rope'
+        
         if config.get('attn_type') == 'gqa':
-            self.self_attn = GroupedQueryAttention(d_model, config['num_q_heads'], config['num_kv_heads'])
-            self.cross_attn = GroupedQueryAttention(d_model, config['num_q_heads'], config['num_kv_heads'])
+            self.self_attn = GroupedQueryAttention(d_model, config['num_q_heads'], config['num_kv_heads'], use_rope=use_rope)
+            # FIX: Disable RoPE for Cross-Attention due to sequence length differences
+            self.cross_attn = GroupedQueryAttention(d_model, config['num_q_heads'], config['num_kv_heads'], use_rope=False)
         else:
-            self.self_attn = MultiHeadAttention(d_model, config['num_heads'])
-            self.cross_attn = MultiHeadAttention(d_model, config['num_heads'])
+            self.self_attn = MultiHeadAttention(d_model, config['num_heads'], use_rope=use_rope)
+            # FIX: Disable RoPE for Cross-Attention due to sequence length differences
+            self.cross_attn = MultiHeadAttention(d_model, config['num_heads'], use_rope=False)
             
         NormClass = RMSNorm if config.get('norm_type') == 'rmsnorm' else LayerNorm
         self.norm1, self.norm2, self.norm3 = NormClass(d_model), NormClass(d_model), NormClass(d_model)
@@ -91,9 +102,14 @@ class Seq2SeqTransformer(nn.Module):
         d_model = config['d_model']
         
         if self.is_blt:
-            self.src_embed = LocalByteEncoder(d_model, patch_size=config['patch_size'])
-            self.tgt_embed = LocalByteEncoder(d_model, patch_size=config['patch_size'])
-            self.generator = LocalByteDecoder(d_model, patch_size=config['patch_size'])
+            # NOTE: vocab_size must be passed through here. LocalByteEncoder/
+            # LocalByteDecoder default to vocab_size=256, but dataset.py adds
+            # +4 to every raw byte to reserve ids 0-3 for PAD/SOS/EOS/UNK, so
+            # ids up to 259 can appear. Without this, embedding a byte value
+            # near 255 raises an out-of-range index error.
+            self.src_embed = LocalByteEncoder(d_model, patch_size=config['patch_size'], vocab_size=vocab_size)
+            self.tgt_embed = LocalByteEncoder(d_model, patch_size=config['patch_size'], vocab_size=vocab_size)
+            self.generator = LocalByteDecoder(d_model, patch_size=config['patch_size'], vocab_size=vocab_size)
         else:
             self.src_embed = nn.Embedding(vocab_size, d_model)
             self.tgt_embed = nn.Embedding(vocab_size, d_model)
@@ -134,7 +150,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scheduler):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
         optimizer.step()
-        scheduler.step()  # MUST BE STEPPED EVERY BATCH
+        scheduler.step()
         
         total_loss += loss.item()
     return total_loss / len(dataloader)
@@ -149,10 +165,11 @@ def evaluate_epoch(model, dataloader, tokenizer, device, config, epoch):
     
     with torch.no_grad():
         for i, (src, tgt) in enumerate(dataloader):
-            if i >= 1:  # Limit evaluation to 2 batches for speed
+            if i >= 1:  
                 break
                 
-            src, tgt = src.to(device), tgt.to(device)
+            # SPEED FIX: Only decode 8 sequences instead of 64 to save massive time
+            src, tgt = src[:8].to(device), tgt[:8].to(device)
             src_mask, _ = create_masks(src, tgt, PAD_IDX)
             
             pred_ids = greedy_decode(model, src, src_mask, config['max_seq_len'], SOS_IDX, device)
@@ -174,16 +191,31 @@ def evaluate_epoch(model, dataloader, tokenizer, device, config, epoch):
                     
     return calculate_metrics(all_preds, all_targets, is_tokenized=is_tokenized)
 
+def corpus_iterator(cipher_path, plain_path):
+    """Yields byte-packed cipher lines and plain text lines for the BPE trainer."""
+    with open(cipher_path, 'r', encoding='utf-8') as fc, open(plain_path, 'r', encoding='utf-8') as fp:
+        for c_line, p_line in zip(fc, fp):
+            c_line = c_line.strip()
+            yield bits_to_byte_str(c_line)
+            yield p_line.strip()
+
 def get_or_build_tokenizer(cipher_path, plain_path, vocab_size=1000, save_path="tokenizer.json"):
     if os.path.exists(save_path):
         print(f"Loading existing tokenizer from {save_path}...")
         return Tokenizer.from_file(save_path)
         
-    print(f"Training new BPE tokenizer (Vocab Size: {vocab_size})...")
+    print(f"Training new BPE tokenizer (Vocab Size: {vocab_size}) with byte-level packing...")
     tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
-    tokenizer.pre_tokenizer = Whitespace()
+    # ByteLevel (not Whitespace!) is required: our cipher "text" is a packed
+    # byte string that can contain raw control/space/newline BYTE VALUES.
+    # Whitespace() would silently split on those, corrupting byte boundaries.
+    # ByteLevel remaps every possible byte (0-255) to a safe printable symbol
+    # first, exactly like GPT-2's byte-level BPE, so nothing gets mis-split.
+    tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
     trainer = BpeTrainer(special_tokens=["[PAD]", "[SOS]", "[EOS]", "[UNK]"], vocab_size=vocab_size)
-    tokenizer.train([cipher_path, plain_path], trainer)
+    
+    # Train using the iterator so the tokenizer learns from the byte-packed data
+    tokenizer.train_from_iterator(corpus_iterator(cipher_path, plain_path), trainer=trainer)
     tokenizer.save(save_path)
     return tokenizer
 
@@ -196,17 +228,11 @@ def main():
     
     wandb.init(project="aNLP-Assignment-1", name=config['run_name'], config=config)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
     torch.backends.cudnn.benchmark = True
-    
     print(f"Training Config {args.config} on {device} with {config['epochs']} epochs...")
     
     if config['tokenization'] == 'subword':
-        tokenizer = get_or_build_tokenizer(
-            'dataset/brown_cipher.txt', 
-            'dataset/brown_plain.txt', 
-            vocab_size=1000
-        )
+        tokenizer = get_or_build_tokenizer('dataset/brown_cipher.txt', 'dataset/brown_plain.txt', vocab_size=1000)
         vocab_size = tokenizer.get_vocab_size()
     else:
         tokenizer = None
@@ -214,14 +240,11 @@ def main():
         
     full_dataset = CipherDataset('dataset/brown_cipher.txt', 'dataset/brown_plain.txt', config, tokenizer=tokenizer) 
     
-    # 90/10 Train/Validation Split
     total_size = len(full_dataset)
     val_size = int(0.1 * total_size)
     train_size = total_size - val_size
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
     
-    # train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn)
-    # val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, collate_fn=collate_fn)
     train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
     
@@ -238,8 +261,6 @@ def main():
     
     for epoch in range(config['epochs']):
         avg_train_loss = train_epoch(model, train_loader, optimizer, criterion, device, scheduler)
-        # scheduler.step()
-        
         metrics = evaluate_epoch(model, val_loader, tokenizer, device, config, epoch)
         
         current_lr = optimizer.param_groups[0]['lr']
