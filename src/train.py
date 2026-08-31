@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader, random_split
 import wandb
 import argparse
 import os
+import time
 
 from models.attention import MultiHeadAttention, GroupedQueryAttention
 from models.norm import LayerNorm, RMSNorm
@@ -17,13 +18,13 @@ CONFIGS = {
     "C1": {
         "run_name": "C1_Base_Model",
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.001, "epochs": 100,
+        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "subword", "pos_type": "sinusoidal", "attn_type": "mha", "norm_type": "layernorm"
     },
     "C2": {
         "run_name": "C2_RoPE_Model",
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0003, "epochs": 100,
+        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "subword", "pos_type": "rope", "attn_type": "mha", "norm_type": "layernorm"
     }
 }
@@ -248,19 +249,41 @@ def main():
     )
 
     for epoch in range(config['epochs']):
+        # Reset CUDA memory stats at the start of each epoch
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(device)
+            
+        start_time = time.time()
+        
+        # Run Training
         avg_train_loss = train_epoch(model, train_loader, optimizer, criterion, device, scheduler)
+        
+        # Calculate Time and Peak VRAM
+        epoch_time = time.time() - start_time
+        peak_memory_mb = 0
+        if torch.cuda.is_available():
+            peak_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+
+        # Run Evaluation
         metrics = evaluate_epoch(model, val_loader, tokenizer, device, config, epoch)
 
         current_lr = optimizer.param_groups[0]['lr']
+        
+        # Print updated CLI logs
         print(f"Epoch {epoch+1}/{config['epochs']} | Train Loss: {avg_train_loss:.4f} | LR: {current_lr:.6f}")
+        print(f"Speed & Memory     -> Time: {epoch_time:.2f}s | Peak VRAM: {peak_memory_mb:.2f} MB")
         print(f"Validation Metrics -> Seq Acc: {metrics['seq_accuracy']:.2f}% | Bit Acc: {metrics['bit_accuracy']:.2f}% | Levenshtein: {metrics['avg_levenshtein']:.2f}")
+        
         if config['tokenization'] == 'subword':
             print(f"Validation Scores  -> BLEU: {metrics['bleu']:.4f} | ROUGE-L: {metrics['rougeL']:.4f}")
 
+        # Log everything to WandB
         wandb.log({
             "epoch": epoch, 
             "train_loss": avg_train_loss,
             "learning_rate": current_lr,
+            "epoch_time_seconds": epoch_time,
+            "peak_gpu_memory_mb": peak_memory_mb,
             **metrics
         })
 
