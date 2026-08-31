@@ -26,6 +26,18 @@ CONFIGS = {
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
         "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "subword", "pos_type": "rope", "attn_type": "mha", "norm_type": "layernorm"
+    },
+    "C3": {
+        "run_name": "C3_GQA_Model",
+        "d_model": 256, "num_heads": 8, "num_q_heads": 8, "num_kv_heads": 2, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
+        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
+        "tokenization": "subword", "pos_type": "sinusoidal", "attn_type": "gqa", "norm_type": "layernorm"
+    },
+    "C4": {
+        "run_name": "C4_RMSNorm_Model",
+        "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
+        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
+        "tokenization": "subword", "pos_type": "sinusoidal", "attn_type": "mha", "norm_type": "rmsnorm"
     }
 }
 
@@ -216,7 +228,7 @@ def get_or_build_tokenizer(cipher_path, plain_path, vocab_size, chunk_size, save
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, choices=['C1', 'C2'], default='C1')
+    parser.add_argument('--config', type=str, choices=['C1', 'C2', 'C3', 'C4'], default='C1')
     args = parser.parse_args()
 
     config = CONFIGS[args.config]
