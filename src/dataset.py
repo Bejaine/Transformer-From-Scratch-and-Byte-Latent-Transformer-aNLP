@@ -132,35 +132,39 @@ class CipherDataset(Dataset):
         self.chunk_size = config['max_seq_len'] 
 
         with open(cipher_path, 'r', encoding='utf-8') as fc, open(plain_path, 'r', encoding='utf-8') as fp:
-            full_cipher_bits = "".join([line.strip() for line in fc.readlines()])
-            full_plain = "".join([line.strip() for line in fp.readlines()])
+            cipher_lines = [line.strip() for line in fc.readlines()]
+            plain_lines = [line.strip() for line in fp.readlines()]
 
-        full_cipher_bytes = bits_to_byte_str(full_cipher_bits)
+        assert len(cipher_lines) == len(plain_lines)
         self.data = []
         
-        for i in range(0, len(full_cipher_bytes), self.chunk_size):
-            c_chunk = full_cipher_bytes[i : i + self.chunk_size]
-            p_chunk = full_plain[i : i + self.chunk_size]
+        # Bug 2 Fix: Chunk WITHIN lines to guarantee the XOR key phase (i % 8 == 0) resets perfectly
+        for c_line, p_line in zip(cipher_lines, plain_lines):
+            c_bytes = bits_to_byte_str(c_line)
+            
+            for i in range(0, len(c_bytes), self.chunk_size):
+                c_chunk = c_bytes[i : i + self.chunk_size]
+                p_chunk = p_line[i : i + self.chunk_size]
 
-            if len(c_chunk) < self.chunk_size:
-                continue
+                if len(c_chunk) < self.chunk_size:
+                    continue
 
-            if self.is_blt:
-                c_bytes = [b + 4 for b in c_chunk.encode('latin-1')]
-                p_bytes = [b + 4 for b in p_chunk.encode('utf-8')]
-                src_encoded = [SOS_IDX] + c_bytes + [EOS_IDX]
-                tgt_encoded = [SOS_IDX] + p_bytes + [EOS_IDX]
-            else:
-                src_ids = self.tokenizer.encode(c_chunk, is_cipher=True)
-                tgt_ids = self.tokenizer.encode(p_chunk, is_cipher=False)
+                if self.is_blt:
+                    c_encoded_bytes = [b + 4 for b in c_chunk.encode('latin-1')]
+                    p_encoded_bytes = [b + 4 for b in p_chunk.encode('utf-8')]
+                    src_encoded = [SOS_IDX] + c_encoded_bytes + [EOS_IDX]
+                    tgt_encoded = [SOS_IDX] + p_encoded_bytes + [EOS_IDX]
+                else:
+                    src_ids = self.tokenizer.encode(c_chunk, is_cipher=True)
+                    tgt_ids = self.tokenizer.encode(p_chunk, is_cipher=False)
 
-                src_encoded = [SOS_IDX] + src_ids + [EOS_IDX]
-                tgt_encoded = [SOS_IDX] + tgt_ids + [EOS_IDX]
+                    src_encoded = [SOS_IDX] + src_ids + [EOS_IDX]
+                    tgt_encoded = [SOS_IDX] + tgt_ids + [EOS_IDX]
 
-            self.data.append((
-                torch.tensor(src_encoded, dtype=torch.long),
-                torch.tensor(tgt_encoded, dtype=torch.long)
-            ))
+                self.data.append((
+                    torch.tensor(src_encoded, dtype=torch.long),
+                    torch.tensor(tgt_encoded, dtype=torch.long)
+                ))
 
     def __len__(self):
         return len(self.data)

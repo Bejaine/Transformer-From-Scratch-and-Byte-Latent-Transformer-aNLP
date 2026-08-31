@@ -180,30 +180,36 @@ def evaluate_epoch(model, dataloader, tokenizer, device, config, epoch):
 
     return calculate_metrics(all_preds, all_targets, is_tokenized=is_tokenized)
 
-def get_or_build_tokenizer(cipher_path, plain_path, vocab_size=512, save_path="tokenizer.json"):
+def corpus_iterator(cipher_path, plain_path, chunk_size):
+    """Chunks the dataset strictly within line boundaries to maintain XOR key phases."""
+    texts = []
+    is_cipher_flags = []
+    
+    with open(cipher_path, 'r', encoding='utf-8') as fc, open(plain_path, 'r', encoding='utf-8') as fp:
+        for c_line, p_line in zip(fc, fp):
+            c_line = c_line.strip()
+            p_line = p_line.strip()
+            c_bytes = bits_to_byte_str(c_line)
+            
+            for i in range(0, len(c_bytes), chunk_size):
+                c_chunk = c_bytes[i:i + chunk_size]
+                p_chunk = p_line[i:i + chunk_size]
+                if len(c_chunk) == chunk_size:
+                    texts.extend([c_chunk, p_chunk])
+                    is_cipher_flags.extend([True, False])
+                    
+    return texts, is_cipher_flags
+
+def get_or_build_tokenizer(cipher_path, plain_path, vocab_size, chunk_size, save_path):
+    """Dynamically builds and saves a Custom BPE tokenizer using specified hyperparameters."""
     if os.path.exists(save_path):
         print(f"Loading existing Custom BPE tokenizer from {save_path}...")
         return CustomBPE.from_file(save_path)
 
-    print(f"Building Custom BPE tokenizer (Vocab Size: {vocab_size})...")
+    print(f"Building Custom BPE tokenizer (Vocab Size: {vocab_size}, Window: {chunk_size})...")
     tokenizer = CustomBPE(vocab_size=vocab_size)
 
-    with open(cipher_path, 'r', encoding='utf-8') as fc, open(plain_path, 'r', encoding='utf-8') as fp:
-        full_cipher_bits = "".join([line.strip() for line in fc.readlines()])
-        full_plain = "".join([line.strip() for line in fp.readlines()])
-
-    full_cipher_bytes = bits_to_byte_str(full_cipher_bits)
-    chunk_size = 64
-
-    texts = []
-    is_cipher_flags = []
-    for i in range(0, len(full_cipher_bytes), chunk_size):
-        c_chunk = full_cipher_bytes[i:i + chunk_size]
-        p_chunk = full_plain[i:i + chunk_size]
-        if len(c_chunk) == chunk_size:
-            texts.extend([c_chunk, p_chunk])
-            is_cipher_flags.extend([True, False])
-
+    texts, is_cipher_flags = corpus_iterator(cipher_path, plain_path, chunk_size)
     tokenizer.train(texts, is_cipher_flags)
     tokenizer.save(save_path)
     return tokenizer
@@ -221,7 +227,15 @@ def main():
     print(f"Training Config {args.config} on {device} with {config['epochs']} epochs...")
 
     if config['tokenization'] == 'subword':
-        tokenizer = get_or_build_tokenizer('dataset/brown_cipher.txt', 'dataset/brown_plain.txt', vocab_size=512)
+        # Safely name the tokenizer using the config to prevent parallel GPU runs from crashing
+        tok_path = f"tokenizer_{config['run_name']}.json"
+        tokenizer = get_or_build_tokenizer(
+            'dataset/brown_cipher.txt', 
+            'dataset/brown_plain.txt', 
+            vocab_size=512, 
+            chunk_size=config['max_seq_len'],
+            save_path=tok_path
+        )
         vocab_size = tokenizer.get_vocab_size()
     else:
         tokenizer = None
@@ -249,27 +263,22 @@ def main():
     )
 
     for epoch in range(config['epochs']):
-        # Reset CUDA memory stats at the start of each epoch
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats(device)
             
         start_time = time.time()
         
-        # Run Training
         avg_train_loss = train_epoch(model, train_loader, optimizer, criterion, device, scheduler)
         
-        # Calculate Time and Peak VRAM
         epoch_time = time.time() - start_time
         peak_memory_mb = 0
         if torch.cuda.is_available():
             peak_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
 
-        # Run Evaluation
         metrics = evaluate_epoch(model, val_loader, tokenizer, device, config, epoch)
 
         current_lr = optimizer.param_groups[0]['lr']
         
-        # Print updated CLI logs
         print(f"Epoch {epoch+1}/{config['epochs']} | Train Loss: {avg_train_loss:.4f} | LR: {current_lr:.6f}")
         print(f"Speed & Memory     -> Time: {epoch_time:.2f}s | Peak VRAM: {peak_memory_mb:.2f} MB")
         print(f"Validation Metrics -> Seq Acc: {metrics['seq_accuracy']:.2f}% | Bit Acc: {metrics['bit_accuracy']:.2f}% | Levenshtein: {metrics['avg_levenshtein']:.2f}")
@@ -277,7 +286,6 @@ def main():
         if config['tokenization'] == 'subword':
             print(f"Validation Scores  -> BLEU: {metrics['bleu']:.4f} | ROUGE-L: {metrics['rougeL']:.4f}")
 
-        # Log everything to WandB
         wandb.log({
             "epoch": epoch, 
             "train_loss": avg_train_loss,
