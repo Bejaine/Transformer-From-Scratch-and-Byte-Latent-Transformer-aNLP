@@ -38,6 +38,13 @@ CONFIGS = {
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
         "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "subword", "pos_type": "sinusoidal", "attn_type": "mha", "norm_type": "rmsnorm"
+    },
+    "C5": {
+        "run_name": "C5_BLT_Model",
+        "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
+        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
+        "tokenization": "blt", "pos_type": "sinusoidal", "attn_type": "mha", "norm_type": "layernorm",
+        "patch_size": 4
     }
 }
 
@@ -118,16 +125,30 @@ class Seq2SeqTransformer(nn.Module):
 
     def encode(self, src: torch.Tensor, src_mask: torch.Tensor) -> torch.Tensor:
         x = self.pos_enc(self.src_embed(src)) if self.pos_enc else self.src_embed(src)
+        if self.is_blt and src_mask is not None:
+            src_mask = src_mask[:, :, :, ::self.src_embed.patch_size]
         for layer in self.encoder_layers: x = layer(x, src_mask)
         return x
 
     def decode(self, tgt: torch.Tensor, enc_out: torch.Tensor, src_mask: torch.Tensor, tgt_mask: torch.Tensor) -> torch.Tensor:
         x = self.pos_enc(self.tgt_embed(tgt)) if self.pos_enc else self.tgt_embed(tgt)
+        if self.is_blt:
+            if src_mask is not None:
+                src_mask = src_mask[:, :, :, ::self.src_embed.patch_size]
+            if tgt_mask is not None:
+                tgt_mask = tgt_mask[:, :, ::self.tgt_embed.patch_size, ::self.tgt_embed.patch_size]
+
         for layer in self.decoder_layers: x = layer(x, enc_out, src_mask, tgt_mask)
         return x
 
     def forward(self, src: torch.Tensor, tgt: torch.Tensor, src_mask: torch.Tensor, tgt_mask: torch.Tensor) -> torch.Tensor:
-        return self.generator(self.decode(tgt, self.encode(src, src_mask), src_mask, tgt_mask))
+        dec_out = self.decode(tgt, self.encode(src, src_mask), src_mask, tgt_mask)
+        
+        if self.is_blt:
+            logits = self.generator(dec_out)
+            return logits[:, :tgt.size(1), :]
+            
+        return self.generator(dec_out)
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device, scheduler):
@@ -206,9 +227,9 @@ def corpus_iterator(cipher_path, plain_path, chunk_size):
             for i in range(0, len(c_bytes), chunk_size):
                 c_chunk = c_bytes[i:i + chunk_size]
                 p_chunk = p_line[i:i + chunk_size]
-                if len(c_chunk) == chunk_size:
-                    texts.extend([c_chunk, p_chunk])
-                    is_cipher_flags.extend([True, False])
+                # if len(c_chunk) == chunk_size:
+                texts.extend([c_chunk, p_chunk])
+                is_cipher_flags.extend([True, False])
                     
     return texts, is_cipher_flags
 
@@ -228,7 +249,7 @@ def get_or_build_tokenizer(cipher_path, plain_path, vocab_size, chunk_size, save
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, choices=['C1', 'C2', 'C3', 'C4'], default='C1')
+    parser.add_argument('--config', type=str, choices=['C1', 'C2', 'C3', 'C4', 'C5'], default='C1')
     args = parser.parse_args()
 
     config = CONFIGS[args.config]

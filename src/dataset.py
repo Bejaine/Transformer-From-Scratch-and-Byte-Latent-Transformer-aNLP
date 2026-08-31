@@ -146,8 +146,8 @@ class CipherDataset(Dataset):
                 c_chunk = c_bytes[i : i + self.chunk_size]
                 p_chunk = p_line[i : i + self.chunk_size]
 
-                if len(c_chunk) < self.chunk_size:
-                    continue
+                # if len(c_chunk) < self.chunk_size:
+                #    continue
 
                 if self.is_blt:
                     c_encoded_bytes = [b + 4 for b in c_chunk.encode('latin-1')]

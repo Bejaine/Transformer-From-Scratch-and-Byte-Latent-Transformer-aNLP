@@ -21,6 +21,8 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol, device, pad_idx=0
     batch_size = src.size(0)
     tgt = torch.full((batch_size, 1), start_symbol, dtype=torch.long, device=device)
     enc_out = model.encode(src, src_mask)
+
+    is_blt = getattr(model, 'is_blt', False)
     
     for _ in range(max_len - 1):
         tgt_pad_mask = create_padding_mask(tgt, pad_idx)
@@ -28,9 +30,18 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol, device, pad_idx=0
         tgt_mask = tgt_pad_mask & tgt_causal_mask
         
         dec_out = model.decode(tgt, enc_out, src_mask, tgt_mask)
-        logits = model.generator(dec_out[:, -1, :])
+
+        if is_blt:
+            # BLT expects the full sequence to unroll its patches correctly
+            logits = model.generator(dec_out)
+            # Pick the exact logit mapped to the current sequence step
+            next_word_logits = logits[:, tgt.size(1) - 1, :]
+        else:
+            # Standard subword processing (C1-C4)
+            logits = model.generator(dec_out[:, -1, :])
+            next_word_logits = logits
         
-        _, next_word = torch.max(logits, dim=-1)
+        _, next_word = torch.max(next_word_logits, dim=-1)
         tgt = torch.cat([tgt, next_word.unsqueeze(1)], dim=1)
         
         # Stop early if all sequences in batch have generated EOS
