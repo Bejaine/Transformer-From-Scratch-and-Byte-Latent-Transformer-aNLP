@@ -19,7 +19,7 @@ class LocalByteEncoder(nn.Module):
         self.byte_embedding = nn.Embedding(vocab_size, d_model)
         
         # 2. Patcher: Projects a group of embedded bytes into a single latent patch.
-        # This is the core of BLT: reducing length L to L / patch_size.
+        # This is the core of BLT: reducing sequence length L to L / patch_size.
         self.patcher = nn.Linear(d_model * patch_size, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -51,7 +51,7 @@ class LocalByteDecoder(nn.Module):
     """
     Local Decoder for the Byte Latent Transformer (BLT) architecture.
     Takes the global transformer's latent patch predictions and unrolls them
-    back into a sequence of raw byte logits.
+    back into a sequence of raw byte logits[cite: 4].
     """
     def __init__(self, d_model: int, patch_size: int = 4, vocab_size: int = 256):
         super().__init__()
@@ -69,10 +69,24 @@ class LocalByteDecoder(nn.Module):
             x = x.unsqueeze(1)
 
         # x shape: [batch_size, num_patches, d_model]
-        batch_size, num_patches, _ = x.size()
+        batch_size, num_patches, d_model = x.size()
+        
+        # ---------------------------------------------------------------------
+        # CRITICAL ABLATION FIX: CAUSAL PATCH SHIFTING
+        # In a standard subword transformer, tokens are shifted by 1 to prevent 
+        # data leakage. Because BLT groups tokens into patches, predicting tokens 
+        # within Patch N using Latent Patch N causes massive data leakage (the 
+        # model learns to just copy the input bytes rather than translate the cipher).
+        # To fix this without altering the core train.py loop (keeping it identical
+        # for the ablation study), we shift the latent patches right by 1. 
+        # This forces Patch N+1's bytes to be predicted strictly from Patch N, 
+        # completely restoring the causal autoregressive property of the model.
+        # ---------------------------------------------------------------------
+        dummy_patch = torch.zeros(batch_size, 1, d_model, device=x.device)
+        shifted_x = torch.cat([dummy_patch, x[:, :-1, :]], dim=1)
         
         # Expand latent patches: [batch_size, num_patches, patch_size * d_model]
-        unrolled = self.unpatcher(x)
+        unrolled = self.unpatcher(shifted_x)
         
         # Reshape into a flat sequence of bytes: [batch_size, num_patches * patch_size, d_model]
         byte_sequence = unrolled.view(batch_size, num_patches * self.patch_size, -1)
