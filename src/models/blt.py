@@ -4,63 +4,69 @@ import torch.nn.functional as F
 
 class LocalByteEncoder(nn.Module):
     """
-    Local Encoder for the Byte Latent Transformer (BLT) architecture.
-    Instead of using subword vocabularies (like BPE), this module takes raw bytes,
-    embeds them, and groups them into 'patches' (latent representations).
-    This significantly reduces the sequence length the global transformer has to process,
-    saving computational overhead and peak GPU memory[cite: 4].
+    Local Encoder for the Byte Latent Transformer (BLT) approach[cite: 4].
+    Instead of using subword vocabularies, we feed raw bytes into a local encoder 
+    to create patch representations[cite: 4]. This reduces sequence length, lowering 
+    computational overhead and peak GPU memory during training[cite: 4].
     """
-    def __init__(self, d_model: int, patch_size: int = 4, vocab_size: int = 256):
+    def __init__(self, d_model: int, patch_size: int = 4, vocab_size: int = 256, is_tgt: bool = False):
         super().__init__()
         self.patch_size = patch_size
         self.d_model = d_model
+        self.is_tgt = is_tgt
         
-        # 1. Byte-level Embedding: Maps raw bytes (0-255) + special tokens to vectors
+        # Maps raw bytes (0-255) + special tokens to vectors
         self.byte_embedding = nn.Embedding(vocab_size, d_model)
         
-        # 2. Patcher: Projects a group of embedded bytes into a single latent patch.
-        # This is the core of BLT: reducing sequence length L to L / patch_size.
+        # Projects a group of embedded bytes into a single latent patch
         self.patcher = nn.Linear(d_model * patch_size, d_model)
+        
+        if self.is_tgt:
+            # A learnable generic "Start of Sequence" patch for the target sequence
+            self.sos_patch = nn.Parameter(torch.randn(1, 1, d_model))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: [batch_size, seq_len]
         batch_size, seq_len = x.size()
         
-        # We must ensure the sequence length is perfectly divisible by the patch_size.
-        # If not, we pad the sequence with 0s (PAD_IDX) at the end.
+        # Ensure sequence length is divisible by patch_size by padding
         remainder = seq_len % self.patch_size
         if remainder != 0:
             pad_len = self.patch_size - remainder
             x = F.pad(x, (0, pad_len), value=0)
             seq_len += pad_len
 
-        # Embed the raw bytes: [batch_size, seq_len, d_model]
         byte_embeds = self.byte_embedding(x)
         
-        # Group the bytes into patches: [batch_size, num_patches, patch_size * d_model]
+        # Group bytes into patches
         num_patches = seq_len // self.patch_size
         grouped_bytes = byte_embeds.view(batch_size, num_patches, -1) 
         
-        # Compress into latent space: [batch_size, num_patches, d_model]
         latent_patches = self.patcher(grouped_bytes)
         
+        if self.is_tgt:
+            # Shift patches right by 1 to enforce patch-level causality.
+            # This ensures Patch N is forced to predict Patch N+1 using the global transformer,
+            # preventing the model from trivial 1-to-1 byte copying.
+            sos_expanded = self.sos_patch.expand(batch_size, -1, -1)
+            latent_patches = torch.cat([sos_expanded, latent_patches[:, :-1, :]], dim=1)
+            
         return latent_patches
 
 
 class LocalByteDecoder(nn.Module):
     """
-    Local Decoder for the Byte Latent Transformer (BLT) architecture.
-    Takes the global transformer's latent patch predictions and unrolls them
-    back into a sequence of raw byte logits[cite: 4].
+    Local Decoder for the Byte Latent Transformer (BLT) approach[cite: 4].
+    After the global transformer processes the latent patches, we decode them 
+    using a local byte-level decoder[cite: 4] to predict the raw output sequence.
     """
     def __init__(self, d_model: int, patch_size: int = 4, vocab_size: int = 256):
         super().__init__()
         self.patch_size = patch_size
 
-        # 1. Unpatcher: Expands a single latent patch back into `patch_size` byte vectors.
+        # Expands a single latent patch back into `patch_size` byte vectors
         self.unpatcher = nn.Linear(d_model, d_model * patch_size)
         
-        # 2. Byte Classifier: Maps the unrolled byte vectors to raw vocabulary logits.
+        # Maps the unrolled byte vectors to raw vocabulary logits
         self.byte_classifier = nn.Linear(d_model, vocab_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -68,30 +74,15 @@ class LocalByteDecoder(nn.Module):
         if x.dim() == 2:
             x = x.unsqueeze(1)
 
-        # x shape: [batch_size, num_patches, d_model]
-        batch_size, num_patches, d_model = x.size()
+        batch_size, num_patches, _ = x.size()
         
-        # ---------------------------------------------------------------------
-        # CRITICAL ABLATION FIX: CAUSAL PATCH SHIFTING
-        # In a standard subword transformer, tokens are shifted by 1 to prevent 
-        # data leakage. Because BLT groups tokens into patches, predicting tokens 
-        # within Patch N using Latent Patch N causes massive data leakage (the 
-        # model learns to just copy the input bytes rather than translate the cipher).
-        # To fix this without altering the core train.py loop (keeping it identical
-        # for the ablation study), we shift the latent patches right by 1. 
-        # This forces Patch N+1's bytes to be predicted strictly from Patch N, 
-        # completely restoring the causal autoregressive property of the model.
-        # ---------------------------------------------------------------------
-        dummy_patch = torch.zeros(batch_size, 1, d_model, device=x.device)
-        shifted_x = torch.cat([dummy_patch, x[:, :-1, :]], dim=1)
+        # Expand latent patches
+        unrolled = self.unpatcher(x)
         
-        # Expand latent patches: [batch_size, num_patches, patch_size * d_model]
-        unrolled = self.unpatcher(shifted_x)
-        
-        # Reshape into a flat sequence of bytes: [batch_size, num_patches * patch_size, d_model]
+        # Reshape into a flat sequence of bytes
         byte_sequence = unrolled.view(batch_size, num_patches * self.patch_size, -1)
         
-        # Predict logits for each byte: [batch_size, unrolled_seq_len, vocab_size]
+        # Predict logits for each byte
         logits = self.byte_classifier(byte_sequence)
         
         return logits

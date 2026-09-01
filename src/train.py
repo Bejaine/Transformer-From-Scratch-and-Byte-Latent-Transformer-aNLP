@@ -18,25 +18,25 @@ CONFIGS = {
     "C1": {
         "run_name": "C1_Base_Model",
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
+        "max_seq_len": 64, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "subword", "pos_type": "sinusoidal", "attn_type": "mha", "norm_type": "layernorm"
     },
     "C2": {
         "run_name": "C2_RoPE_Model",
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
+        "max_seq_len": 64, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "subword", "pos_type": "rope", "attn_type": "mha", "norm_type": "layernorm"
     },
     "C3": {
         "run_name": "C3_GQA_Model",
         "d_model": 256, "num_heads": 8, "num_q_heads": 8, "num_kv_heads": 2, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
+        "max_seq_len": 64, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "subword", "pos_type": "sinusoidal", "attn_type": "gqa", "norm_type": "layernorm"
     },
     "C4": {
         "run_name": "C4_RMSNorm_Model",
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
+        "max_seq_len": 64, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "subword", "pos_type": "sinusoidal", "attn_type": "mha", "norm_type": "rmsnorm"
     },
     "C5": {
@@ -111,8 +111,8 @@ class Seq2SeqTransformer(nn.Module):
         d_model = config['d_model']
 
         if self.is_blt:
-            self.src_embed = LocalByteEncoder(d_model, patch_size=config['patch_size'], vocab_size=vocab_size)
-            self.tgt_embed = LocalByteEncoder(d_model, patch_size=config['patch_size'], vocab_size=vocab_size)
+            self.src_embed = LocalByteEncoder(d_model, patch_size=config['patch_size'], vocab_size=vocab_size, is_tgt=False)
+            self.tgt_embed = LocalByteEncoder(d_model, patch_size=config['patch_size'], vocab_size=vocab_size, is_tgt=True)
             self.generator = LocalByteDecoder(d_model, patch_size=config['patch_size'], vocab_size=vocab_size)
         else:
             self.src_embed = nn.Embedding(vocab_size, d_model)
