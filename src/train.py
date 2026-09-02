@@ -18,31 +18,31 @@ CONFIGS = {
     "C1": {
         "run_name": "C1_Base_Model",
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 64, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
+        "max_seq_len": 128, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "subword", "pos_type": "sinusoidal", "attn_type": "mha", "norm_type": "layernorm"
     },
     "C2": {
         "run_name": "C2_RoPE_Model",
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 64, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
+        "max_seq_len": 128, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "subword", "pos_type": "rope", "attn_type": "mha", "norm_type": "layernorm"
     },
     "C3": {
         "run_name": "C3_GQA_Model",
         "d_model": 256, "num_heads": 8, "num_q_heads": 8, "num_kv_heads": 2, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 64, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
+        "max_seq_len": 128, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "subword", "pos_type": "sinusoidal", "attn_type": "gqa", "norm_type": "layernorm"
     },
     "C4": {
         "run_name": "C4_RMSNorm_Model",
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 64, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
+        "max_seq_len": 128, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "subword", "pos_type": "sinusoidal", "attn_type": "mha", "norm_type": "rmsnorm"
     },
     "C5": {
         "run_name": "C5_BLT_Model",
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
+        "max_seq_len": 128, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "blt", "pos_type": "sinusoidal", "attn_type": "mha", "norm_type": "layernorm",
         "patch_size": 4
     }
@@ -274,12 +274,27 @@ def main():
         tokenizer = None
         vocab_size = 260
 
-    full_dataset = CipherDataset('dataset/brown_cipher.txt', 'dataset/brown_plain.txt', config, tokenizer=tokenizer) 
+    # full_dataset = CipherDataset('dataset/brown_cipher.txt', 'dataset/brown_plain.txt', config, tokenizer=tokenizer) 
 
-    total_size = len(full_dataset)
-    val_size = int(0.1 * total_size)
-    train_size = total_size - val_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
+    # total_size = len(full_dataset)
+    # val_size = int(0.1 * total_size)
+    # train_size = total_size - val_size
+    # train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
+
+    # train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
+    # val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
+
+    # 1. Build the Training Dataset (64-byte chunks)
+    full_train_dataset = CipherDataset('dataset/brown_cipher.txt', 'dataset/brown_plain.txt', config, tokenizer=tokenizer) 
+    train_size = int(0.9 * len(full_train_dataset))
+    train_dataset = torch.utils.data.Subset(full_train_dataset, range(0, train_size))
+
+    # 2. Build the Validation Dataset (128-byte chunks)
+    val_config = config.copy()
+    val_config['max_seq_len'] = 128
+    full_val_dataset = CipherDataset('dataset/brown_cipher.txt', 'dataset/brown_plain.txt', val_config, tokenizer=tokenizer) 
+    val_start = int(0.9 * len(full_val_dataset))
+    val_dataset = torch.utils.data.Subset(full_val_dataset, range(val_start, len(full_val_dataset)))
 
     train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
