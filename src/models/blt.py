@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from models.attention import MultiHeadAttention
 
 class LocalByteEncoder(nn.Module):
     """
     Local Encoder for the Byte Latent Transformer (BLT) approach[cite: 5].
-    Groups raw bytes into latent patches to reduce sequence length[cite: 5].
+    Matches the architectural diagram: Byte-Level Transformer -> Cross-Attention Pooling.
     """
     def __init__(self, d_model: int, patch_size: int = 4, vocab_size: int = 256, is_tgt: bool = False):
         super().__init__()
@@ -15,11 +16,18 @@ class LocalByteEncoder(nn.Module):
         
         self.byte_embedding = nn.Embedding(vocab_size, d_model)
         
-        # Core Patcher: Linear projection followed by GELU and LayerNorm 
-        # to prevent variance explosion and catastrophic forgetting during high LR.
-        self.patcher = nn.Linear(d_model * patch_size, d_model)
-        self.activation = nn.GELU()
-        self.norm = nn.LayerNorm(d_model)
+        # FIX: Intra-Patch Positional Encoding. 
+        # This prevents the MultiHeadAttention from scrambling the byte order!
+        self.intra_patch_pos = nn.Parameter(torch.randn(1, patch_size, d_model))
+        
+        # 1. Byte-Level Small Transformer
+        self.local_self_attn = MultiHeadAttention(d_model, num_heads=4, use_rope=False)
+        self.norm1 = nn.LayerNorm(d_model)
+        
+        # 2. Encoder Patch Cross Attention
+        self.patch_query = nn.Parameter(torch.randn(1, 1, d_model))
+        self.patch_cross_attn = MultiHeadAttention(d_model, num_heads=4, use_rope=False)
+        self.norm2 = nn.LayerNorm(d_model)
         
         if self.is_tgt:
             self.sos_patch = nn.Parameter(torch.randn(1, 1, d_model))
@@ -36,11 +44,20 @@ class LocalByteEncoder(nn.Module):
         byte_embeds = self.byte_embedding(x)
         
         num_patches = seq_len // self.patch_size
-        grouped_bytes = byte_embeds.view(batch_size, num_patches, -1) 
+        grouped_bytes = byte_embeds.view(batch_size * num_patches, self.patch_size, -1) 
         
-        # Apply projection, non-linearity, and normalization
-        latent_patches = self.patcher(grouped_bytes)
-        latent_patches = self.norm(self.activation(latent_patches))
+        # FIX: Inject positional information before the attention layer
+        grouped_bytes = grouped_bytes + self.intra_patch_pos
+        
+        # 1. Local Byte-Level Context
+        local_out = self.local_self_attn(q=self.norm1(grouped_bytes), k=self.norm1(grouped_bytes), v=self.norm1(grouped_bytes))
+        grouped_bytes = grouped_bytes + local_out
+        
+        # 2. Cross-Attention Pooling
+        queries = self.patch_query.expand(batch_size * num_patches, -1, -1)
+        patch_repr = self.patch_cross_attn(q=self.norm2(queries), k=self.norm2(grouped_bytes), v=self.norm2(grouped_bytes))
+        
+        latent_patches = patch_repr.view(batch_size, num_patches, self.d_model)
         
         if self.is_tgt:
             sos_expanded = self.sos_patch.expand(batch_size, -1, -1)
@@ -52,15 +69,22 @@ class LocalByteEncoder(nn.Module):
 class LocalByteDecoder(nn.Module):
     """
     Local Decoder for the Byte Latent Transformer (BLT) approach[cite: 5].
-    Unrolls global transformer latent patches back into raw byte logits[cite: 5].
+    Matches the architectural diagram: Cross-Attention Unpatching -> Byte-Level Transformer.
     """
     def __init__(self, d_model: int, patch_size: int = 4, vocab_size: int = 256):
         super().__init__()
         self.patch_size = patch_size
+        self.d_model = d_model
 
-        # Unpatcher with activation to stabilize the unrolled representations
-        self.unpatcher = nn.Linear(d_model, d_model * patch_size)
-        self.activation = nn.GELU()
+        # 1. Decoder Patch Cross Attention
+        # These learned queries inherently act as positional encodings for the unrolling!
+        self.unpatch_queries = nn.Parameter(torch.randn(1, patch_size, d_model))
+        self.unpatch_cross_attn = MultiHeadAttention(d_model, num_heads=4, use_rope=False)
+        self.norm1 = nn.LayerNorm(d_model)
+        
+        # 2. Small Byte-Level Transformer
+        self.local_self_attn = MultiHeadAttention(d_model, num_heads=4, use_rope=False)
+        self.norm2 = nn.LayerNorm(d_model)
         
         self.byte_classifier = nn.Linear(d_model, vocab_size)
 
@@ -70,11 +94,21 @@ class LocalByteDecoder(nn.Module):
 
         batch_size, num_patches, _ = x.size()
         
-        # Expand latent patches and apply non-linearity
-        unrolled = self.unpatcher(x)
-        unrolled = self.activation(unrolled)
+        global_patches = x.view(batch_size * num_patches, 1, self.d_model)
+        queries = self.unpatch_queries.expand(batch_size * num_patches, -1, -1)
         
-        byte_sequence = unrolled.view(batch_size, num_patches * self.patch_size, -1)
+        # 1. Cross-Attention Expansion
+        unrolled = self.unpatch_cross_attn(q=self.norm1(queries), k=self.norm1(global_patches), v=self.norm1(global_patches))
+        unrolled = queries + unrolled
+        
+        # 2. Local Byte-Level Smoothing 
+        causal_mask = torch.tril(torch.ones((self.patch_size, self.patch_size), device=x.device)).bool()
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+        
+        local_out = self.local_self_attn(q=self.norm2(unrolled), k=self.norm2(unrolled), v=self.norm2(unrolled), mask=causal_mask)
+        unrolled = unrolled + local_out
+        
+        byte_sequence = unrolled.view(batch_size, num_patches * self.patch_size, self.d_model)
         logits = self.byte_classifier(byte_sequence)
         
         return logits
