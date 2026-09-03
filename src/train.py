@@ -6,6 +6,7 @@ import wandb
 import argparse
 import os
 import time
+import json
 
 from models.attention import MultiHeadAttention, GroupedQueryAttention
 from models.norm import LayerNorm, RMSNorm
@@ -18,31 +19,31 @@ CONFIGS = {
     "C1": {
         "run_name": "C1_Base_Model",
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 128, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
+        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "subword", "pos_type": "sinusoidal", "attn_type": "mha", "norm_type": "layernorm"
     },
     "C2": {
         "run_name": "C2_RoPE_Model",
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 128, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
+        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "subword", "pos_type": "rope", "attn_type": "mha", "norm_type": "layernorm"
     },
     "C3": {
         "run_name": "C3_GQA_Model",
         "d_model": 256, "num_heads": 8, "num_q_heads": 8, "num_kv_heads": 2, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 128, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
+        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "subword", "pos_type": "sinusoidal", "attn_type": "gqa", "norm_type": "layernorm"
     },
     "C4": {
         "run_name": "C4_RMSNorm_Model",
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 128, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
+        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "subword", "pos_type": "sinusoidal", "attn_type": "mha", "norm_type": "rmsnorm"
     },
     "C5": {
         "run_name": "C5_BLT_Model",
         "d_model": 256, "num_heads": 8, "num_layers": 4, "d_ff": 1024, "dropout": 0.1,
-        "max_seq_len": 128, "batch_size": 128, "learning_rate": 0.0005, "epochs": 100,
+        "max_seq_len": 64, "batch_size": 64, "learning_rate": 0.0005, "epochs": 100,
         "tokenization": "blt", "pos_type": "sinusoidal", "attn_type": "mha", "norm_type": "layernorm",
         "patch_size": 4
     }
@@ -214,7 +215,6 @@ def evaluate_epoch(model, dataloader, tokenizer, device, config, epoch):
     return calculate_metrics(all_preds, all_targets, is_tokenized=is_tokenized)
 
 def corpus_iterator(cipher_path, plain_path, chunk_size):
-    """Chunks the dataset strictly within line boundaries to maintain XOR key phases."""
     texts = []
     is_cipher_flags = []
     
@@ -227,14 +227,12 @@ def corpus_iterator(cipher_path, plain_path, chunk_size):
             for i in range(0, len(c_bytes), chunk_size):
                 c_chunk = c_bytes[i:i + chunk_size]
                 p_chunk = p_line[i:i + chunk_size]
-                # if len(c_chunk) == chunk_size:
                 texts.extend([c_chunk, p_chunk])
                 is_cipher_flags.extend([True, False])
                     
     return texts, is_cipher_flags
 
 def get_or_build_tokenizer(cipher_path, plain_path, vocab_size, chunk_size, save_path):
-    """Dynamically builds and saves a Custom BPE tokenizer using specified hyperparameters."""
     if os.path.exists(save_path):
         print(f"Loading existing Custom BPE tokenizer from {save_path}...")
         return CustomBPE.from_file(save_path)
@@ -247,21 +245,44 @@ def get_or_build_tokenizer(cipher_path, plain_path, vocab_size, chunk_size, save
     tokenizer.save(save_path)
     return tokenizer
 
+def save_vocab_json(tokenizer, is_blt, save_path):
+    """Explicitly builds and exports a readable vocab.json file."""
+    vocab_dict = {"[PAD]": 0, "[SOS]": 1, "[EOS]": 2, "[UNK]": 3}
+    for i in range(256):
+        vocab_dict[f"byte_{i}"] = i + 4
+        
+    if not is_blt and tokenizer is not None:
+        for pair_str, new_id in tokenizer.merges.items():
+            vocab_dict[f"merge_{pair_str}"] = new_id
+            
+    with open(save_path, 'w') as f:
+        json.dump(vocab_dict, f, indent=4)
+    print(f"Saved vocabulary to {save_path}")
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, choices=['C1', 'C2', 'C3', 'C4', 'C5'], default='C1')
     args = parser.parse_args()
 
     config = CONFIGS[args.config]
+    run_name = config['run_name']
+    
+    # Save the architecture configuration JSON
+    config_path = f"{run_name}_config.json"
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=4)
+    print(f"Saved configuration to {config_path}")
 
-    wandb.init(project="aNLP-Assignment-1", name=config['run_name'], config=config)
+    wandb.init(project="aNLP-Assignment-1", name=run_name, config=config)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.backends.cudnn.benchmark = True
     print(f"Training Config {args.config} on {device} with {config['epochs']} epochs...")
 
-    if config['tokenization'] == 'subword':
-        # Safely name the tokenizer using the config to prevent parallel GPU runs from crashing
-        tok_path = f"tokenizer_{config['run_name']}.json"
+    is_blt = config['tokenization'] == 'blt'
+    tok_path = f"{run_name}_tokenizer.json"
+    vocab_path = f"{run_name}_vocab.json"
+    
+    if not is_blt:
         tokenizer = get_or_build_tokenizer(
             'dataset/brown_cipher.txt', 
             'dataset/brown_plain.txt', 
@@ -273,25 +294,16 @@ def main():
     else:
         tokenizer = None
         vocab_size = 260
+        
+    # Generate explicit vocab mapping
+    save_vocab_json(tokenizer, is_blt, vocab_path)
 
-    # full_dataset = CipherDataset('dataset/brown_cipher.txt', 'dataset/brown_plain.txt', config, tokenizer=tokenizer) 
-
-    # total_size = len(full_dataset)
-    # val_size = int(0.1 * total_size)
-    # train_size = total_size - val_size
-    # train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
-
-    # train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
-    # val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
-
-    # 1. Build the Training Dataset (64-byte chunks)
     full_train_dataset = CipherDataset('dataset/brown_cipher.txt', 'dataset/brown_plain.txt', config, tokenizer=tokenizer) 
     train_size = int(0.9 * len(full_train_dataset))
     train_dataset = torch.utils.data.Subset(full_train_dataset, range(0, train_size))
 
-    # 2. Build the Validation Dataset (128-byte chunks)
     val_config = config.copy()
-    val_config['max_seq_len'] = 128
+    val_config['max_seq_len'] = config['max_seq_len']
     full_val_dataset = CipherDataset('dataset/brown_cipher.txt', 'dataset/brown_plain.txt', val_config, tokenizer=tokenizer) 
     val_start = int(0.9 * len(full_val_dataset))
     val_dataset = torch.utils.data.Subset(full_val_dataset, range(val_start, len(full_val_dataset)))
@@ -300,6 +312,9 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
 
     model = Seq2SeqTransformer(config, vocab_size).to(device)
+    
+    print(f"Total Parameters for {args.config}: {sum(p.numel() for p in model.parameters()):,}")
+    
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
 
@@ -331,7 +346,7 @@ def main():
         print(f"Speed & Memory     -> Time: {epoch_time:.2f}s | Peak VRAM: {peak_memory_mb:.2f} MB")
         print(f"Validation Metrics -> Seq Acc: {metrics['seq_accuracy']:.2f}% | Bit Acc: {metrics['bit_accuracy']:.2f}% | Levenshtein: {metrics['avg_levenshtein']:.2f}")
         
-        if config['tokenization'] == 'subword':
+        if not is_blt:
             print(f"Validation Scores  -> BLEU: {metrics['bleu']:.4f} | ROUGE-L: {metrics['rougeL']:.4f}")
 
         wandb.log({
@@ -342,6 +357,11 @@ def main():
             "peak_gpu_memory_mb": peak_memory_mb,
             **metrics
         })
+
+    # Save the final model checkpoint
+    checkpoint_path = f"{run_name}_model.pt"
+    torch.save(model.state_dict(), checkpoint_path)
+    print(f"\nSaved model weights successfully to {checkpoint_path}")
 
 if __name__ == "__main__":
     main()
